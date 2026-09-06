@@ -6,8 +6,9 @@ PyTorch utilities for ResNet50 transfer learning experiments, designed for adult
 
 - ResNet50 with ImageNet, adult checkpoint, or random initialization
 - Fine-tuning modes: `head`, `layer4`, `layer3_4`, `full`
-- Repeated stratified K-fold cross-validation
-- Default: 5 seeds x 5 folds
+- Patient-level Stratified Group K-fold cross-validation
+- Default: 5 seeds × 5 folds
+- Prevention of patient-level data leakage across training and validation folds
 - Per-seed OOF predictions and mean OOF prediction
 - Fold AUC, seed-level OOF AUC, training history, and best weights
 
