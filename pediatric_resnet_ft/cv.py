@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
@@ -114,17 +114,18 @@ def run_cv(
     image_col: str = "path",
     label_col: str = "label",
     id_col: Optional[str] = None,
+    group_col: Optional[str] = None,
     output_dir: str = "results",
     num_workers: int = 4,
     image_size: int = 224,
     reset_head: bool = False,
     device: Optional[str] = None,
 ):
-    """Run repeated stratified K-fold CV and save per-seed OOF predictions.
+    """Run repeated K-fold CV and save per-seed OOF predictions.
 
-    Each seed defines a complete StratifiedKFold partition. For fair comparisons
-    between pretraining/fine-tuning strategies, reuse exactly the same seeds and
-    n_splits across experiments.
+    If group_col is provided, StratifiedGroupKFold is used so all images from the
+    same patient remain in the same fold. If group_col is omitted but id_col is
+    provided, id_col is automatically used as the grouping variable.
     """
     df = pd.read_csv(csv_path).reset_index(drop=True)
     for col in (image_col, label_col):
@@ -133,6 +134,10 @@ def run_cv(
 
     if id_col is not None and id_col not in df.columns:
         raise ValueError(f"CSV is missing id_col: {id_col}")
+
+    effective_group_col = group_col if group_col is not None else id_col
+    if effective_group_col is not None and effective_group_col not in df.columns:
+        raise ValueError(f"CSV is missing group_col: {effective_group_col}")
 
     output = Path(output_dir)
     weights_dir = output / "weights"
@@ -143,25 +148,47 @@ def run_cv(
     train_tf, valid_tf = default_transforms(image_size)
     y = df[label_col].astype(int).to_numpy()
 
-    base_cols = [id_col] if id_col else []
+    base_cols = []
+    if id_col:
+        base_cols.append(id_col)
+    if effective_group_col and effective_group_col not in base_cols:
+        base_cols.append(effective_group_col)
     base_cols += [image_col, label_col]
     oof_df = df[base_cols].copy()
     fold_rows, history_rows, seed_rows = [], [], []
 
     for seed in seeds:
         seed_everything(int(seed))
-        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=int(seed))
+        if effective_group_col is not None:
+            splitter = StratifiedGroupKFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=int(seed),
+            )
+            split_iter = splitter.split(df, y, groups=df[effective_group_col])
+        else:
+            splitter = StratifiedKFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=int(seed),
+            )
+            split_iter = splitter.split(df, y)
+
         seed_oof = np.full(len(df), np.nan, dtype=float)
         seed_folds = np.full(len(df), -1, dtype=int)
 
-        for fold, (train_idx, valid_idx) in enumerate(splitter.split(df, y)):
+        for fold, (train_idx, valid_idx) in enumerate(split_iter):
             seed_everything(int(seed) + fold)
             train_ds = ImageTableDataset(df.iloc[train_idx], image_col, label_col, train_tf)
             valid_ds = ImageTableDataset(df.iloc[valid_idx], image_col, label_col, valid_tf)
-            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                      num_workers=num_workers, pin_memory=device.startswith("cuda"))
-            valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False,
-                                      num_workers=num_workers, pin_memory=device.startswith("cuda"))
+            train_loader = DataLoader(
+                train_ds, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, pin_memory=device.startswith("cuda")
+            )
+            valid_loader = DataLoader(
+                valid_ds, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, pin_memory=device.startswith("cuda")
+            )
 
             model = build_resnet50(
                 pretrained=pretrained,
@@ -186,7 +213,7 @@ def run_cv(
                 train_loss, train_auc, _, _ = _run_epoch(
                     model, train_loader, criterion, device, optimizer
                 )
-                val_loss, val_auc, _, val_prob = _run_epoch(
+                val_loss, val_auc, _, _ = _run_epoch(
                     model, valid_loader, criterion, device
                 )
                 scheduler.step()
@@ -203,14 +230,25 @@ def run_cv(
                     torch.save(model.state_dict(), best_path)
 
             model.load_state_dict(torch.load(best_path, map_location=device))
-            val_loss, val_auc, _, val_prob = _run_epoch(model, valid_loader, criterion, device)
+            val_loss, val_auc, _, val_prob = _run_epoch(
+                model, valid_loader, criterion, device
+            )
             seed_oof[valid_idx] = val_prob
             seed_folds[valid_idx] = fold
-            fold_rows.append({
-                "seed": seed, "fold": fold, "n_train": len(train_idx),
-                "n_valid": len(valid_idx), "auc": val_auc,
-                "loss": val_loss, "best_weight": str(best_path),
-            })
+
+            fold_row = {
+                "seed": seed,
+                "fold": fold,
+                "n_train_images": len(train_idx),
+                "n_valid_images": len(valid_idx),
+                "auc": val_auc,
+                "loss": val_loss,
+                "best_weight": str(best_path),
+            }
+            if effective_group_col is not None:
+                fold_row["n_train_groups"] = df.iloc[train_idx][effective_group_col].nunique()
+                fold_row["n_valid_groups"] = df.iloc[valid_idx][effective_group_col].nunique()
+            fold_rows.append(fold_row)
 
             del model
             if torch.cuda.is_available():
@@ -218,8 +256,7 @@ def run_cv(
 
         oof_df[f"fold_seed{seed}"] = seed_folds
         oof_df[f"oof_seed{seed}"] = seed_oof
-        seed_auc = _safe_auc(y, seed_oof)
-        seed_rows.append({"seed": seed, "oof_auc": seed_auc})
+        seed_rows.append({"seed": seed, "oof_auc": _safe_auc(y, seed_oof)})
 
     pred_cols = [f"oof_seed{s}" for s in seeds]
     oof_df["oof_mean"] = oof_df[pred_cols].mean(axis=1)
