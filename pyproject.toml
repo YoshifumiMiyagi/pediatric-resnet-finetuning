@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pediatric-resnet-ft"
-version = "0.1.0"
+version = "0.1.1"
 description = "ResNet50 transfer learning and repeated OOF evaluation for pediatric chest X-ray studies"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,7 +17,8 @@ dependencies = [
   "numpy>=1.23",
   "pandas>=1.5",
   "scikit-learn>=1.2",
-  "Pillow>=9.0"
+  "Pillow>=9.0",
+  "openpyxl>=3.1"
 ]
 
 [tool.setuptools.packages.find]
