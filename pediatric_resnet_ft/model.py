@@ -11,12 +11,19 @@ VALID_MODES = {"head", "layer4", "layer3_4", "full"}
 
 
 def _clean_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {k.replace("module.", ""): v for k, v in state_dict.items()}
+    cleaned = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for prefix in ("module.", "model."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+        cleaned[new_key] = value
+    return cleaned
 
 
 def _extract_state_dict(checkpoint):
     if isinstance(checkpoint, dict):
-        for key in ("model_state_dict", "state_dict", "model"):
+        for key in ("model_state_dict", "state_dict", "model_state", "model"):
             if key in checkpoint and isinstance(checkpoint[key], dict):
                 return checkpoint[key]
     return checkpoint
@@ -70,8 +77,10 @@ def build_resnet50(
             model.load_state_dict(state_dict, strict=True)
         except RuntimeError as exc:
             raise RuntimeError(
-                "Adult checkpoint could not be loaded strictly. Ensure the adult "
-                "model is torchvision ResNet50 and has the same output dimension."
+                "Adult checkpoint weights were found but could not be loaded strictly. "
+                "Ensure the checkpoint uses torchvision ResNet50 and the same output "
+                "dimension (binary classification should use fc=Linear(2048, 1)).\n"
+                f"Original error: {exc}"
             ) from exc
 
         if reset_head:
