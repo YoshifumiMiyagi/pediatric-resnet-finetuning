@@ -11,4 +11,4 @@ __all__ = [
     "build_age_group_csvs",
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
