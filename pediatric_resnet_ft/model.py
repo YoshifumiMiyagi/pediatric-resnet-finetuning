@@ -33,25 +33,14 @@ def build_resnet50(
     pretrained: str = "imagenet",
     pretrained_path: Optional[str] = None,
     mode: str = "layer4",
-    num_outputs: int = 1,
+    num_outputs: Optional[int] = None,
     reset_head: bool = False,
 ) -> nn.Module:
     """Build a ResNet50 for pediatric fine-tuning.
 
-    Parameters
-    ----------
-    pretrained:
-        "imagenet", "adult", or "none".
-    pretrained_path:
-        Required when pretrained="adult". The adult checkpoint should be a
-        ResNet50 with a compatible architecture.
-    mode:
-        "head", "layer4", "layer3_4", or "full".
-    num_outputs:
-        Number of output logits. Use 1 for binary classification.
-    reset_head:
-        If True, reinitialize the final fc layer after loading adult weights.
-        Useful for comparing transferred representations with a fresh classifier.
+    For adult checkpoints, the classifier output dimension is auto-detected from
+    fc.weight when num_outputs is None. This allows transfer from 2-logit
+    CrossEntropy classifiers as well as 1-logit BCE classifiers.
     """
     pretrained = pretrained.lower()
     mode = mode.lower()
@@ -60,45 +49,50 @@ def build_resnet50(
         raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
 
     if pretrained == "imagenet":
+        out_dim = 1 if num_outputs is None else int(num_outputs)
         model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        model.fc = nn.Linear(model.fc.in_features, num_outputs)
+        model.fc = nn.Linear(model.fc.in_features, out_dim)
 
     elif pretrained == "adult":
         if pretrained_path is None:
             raise ValueError("pretrained_path is required when pretrained='adult'.")
 
-        model = models.resnet50(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, num_outputs)
-
         checkpoint = torch.load(Path(pretrained_path), map_location="cpu")
         state_dict = _clean_state_dict(_extract_state_dict(checkpoint))
 
-        try:
-            model.load_state_dict(state_dict, strict=True)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Adult checkpoint weights were found but could not be loaded strictly. "
-                "Ensure the checkpoint uses torchvision ResNet50 and the same output "
-                "dimension (binary classification should use fc=Linear(2048, 1)).\n"
-                f"Original error: {exc}"
-            ) from exc
+        if "fc.weight" not in state_dict:
+            raise RuntimeError("Adult checkpoint does not contain fc.weight.")
+
+        checkpoint_out = int(state_dict["fc.weight"].shape[0])
+        out_dim = checkpoint_out if num_outputs is None else int(num_outputs)
+
+        model = models.resnet50(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, checkpoint_out)
+        model.load_state_dict(state_dict, strict=True)
 
         if reset_head:
-            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = nn.Linear(model.fc.in_features, out_dim)
+        elif out_dim != checkpoint_out:
+            raise ValueError(
+                f"Adult checkpoint has {checkpoint_out} outputs but num_outputs={out_dim}. "
+                "Use num_outputs=None to preserve the adult head, or reset_head=True "
+                "to replace the classifier."
+            )
 
     elif pretrained == "none":
+        out_dim = 1 if num_outputs is None else int(num_outputs)
         model = models.resnet50(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, num_outputs)
+        model.fc = nn.Linear(model.fc.in_features, out_dim)
 
     else:
         raise ValueError("pretrained must be 'imagenet', 'adult', or 'none'.")
 
+    model._pediatric_resnet_num_outputs = int(model.fc.out_features)
     set_finetune_mode(model, mode)
     return model
 
 
 def set_finetune_mode(model: nn.Module, mode: str) -> nn.Module:
-    """Freeze/unfreeze ResNet50 parameters according to a fine-tuning mode."""
     mode = mode.lower()
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
